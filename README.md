@@ -43,7 +43,8 @@ Movement body:
 
 - Keep dependencies to a minimum. Gin is the only direct runtime dependency; everything else uses the standard library, including the CORS and security-header middleware.
 - Pin exact versions in `go.mod` and commit `go.sum`. Checksums are verified against `sum.golang.org`, and CI runs `go mod verify` plus `go mod tidy -diff`.
-- Wait for new versions to age. Don't adopt a release until it's at least 14 days old; Dependabot enforces this with `cooldown`. Check a version's date with `go list -m -json <module>@<version>`.
+- Wait for new versions to age. Don't adopt a release until it's at least 7 days old; Dependabot enforces this with `cooldown`. Check a version's date with `go list -m -json <module>@<version>`.
+- Security fixes skip the wait. When `govulncheck` flags a vulnerability, upgrade to the fixed version right away, even if it's newer than 7 days.
 - CI uses `GOFLAGS=-mod=readonly`, so builds can't silently change dependencies, and `GOTOOLCHAIN=local`, so it never downloads a toolchain.
 - GitHub Actions are pinned to full commit SHAs. Workflows get read-only `contents` permission, and checkout runs with `persist-credentials: false`.
 - CI runs `govulncheck` at a pinned version (`go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`), with the download checked against `sum.golang.org`. This keeps its dependencies out of this module.
