@@ -46,5 +46,5 @@ Movement body:
 - Wait for new versions to age. Don't adopt a release until it's at least 14 days old; Dependabot enforces this with `cooldown`. Check a version's date with `go list -m -json <module>@<version>`.
 - CI uses `GOFLAGS=-mod=readonly`, so builds can't silently change dependencies, and `GOTOOLCHAIN=local`, so it never downloads a toolchain.
 - GitHub Actions are pinned to full commit SHAs. Workflows get read-only `contents` permission, and checkout runs with `persist-credentials: false`.
-- `govulncheck` is pinned as a Go tool in `go.mod` and runs via `go tool govulncheck ./...`.
+- CI runs `govulncheck` at a pinned version (`go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...`), with the download checked against `sum.golang.org`. This keeps its dependencies out of this module.
 - Before adding a dependency, review it (maintainers, recent activity, transitive deps from `go mod graph`) and justify it with `go mod why`.
