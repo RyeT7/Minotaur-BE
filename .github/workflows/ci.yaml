@@ -17,6 +17,22 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.11-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+        env:
+          POSTGRES_USER: minotaur
+          POSTGRES_PASSWORD: minotaur
+          POSTGRES_DB: minotaur_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U minotaur -d minotaur_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://minotaur:minotaur@localhost:5432/minotaur_test?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

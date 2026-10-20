@@ -26,11 +26,13 @@ func NewRouter(store *inventory.Store, opts Options) (*gin.Engine, error) {
 
 	r.Use(gin.Logger(), gin.Recovery(), securityHeaders(), cors(opts.AllowedOrigins), limitBody(maxBodyBytes))
 
+	h := &handlers{store: store}
+
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+	r.GET("/readyz", h.ready)
 
-	h := &handlers{store: store}
 	v1 := r.Group("/api/v1")
 	{
 		v1.GET("/items", h.listItems)

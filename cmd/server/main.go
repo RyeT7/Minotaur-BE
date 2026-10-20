@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RyeT7/Minotaur-BE/internal/database"
 	"github.com/RyeT7/Minotaur-BE/internal/httpapi"
 	"github.com/RyeT7/Minotaur-BE/internal/inventory"
 )
@@ -25,8 +27,25 @@ func main() {
 func run() error {
 	addr := envOr("ADDR", ":8080")
 	origins := splitList(envOr("CORS_ALLOWED_ORIGINS", "http://localhost:5173"))
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
 
-	router, err := httpapi.NewRouter(inventory.NewStore(nil), httpapi.Options{AllowedOrigins: origins})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := database.Open(ctx, dbURL, nil)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	if err := database.Migrate(ctx, pool); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+
+	router, err := httpapi.NewRouter(inventory.NewStore(pool, nil), httpapi.Options{AllowedOrigins: origins})
 	if err != nil {
 		return err
 	}
@@ -40,9 +59,6 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
