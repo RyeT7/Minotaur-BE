@@ -1,330 +1,268 @@
 package inventory
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"math"
-	"sort"
-	"strings"
-	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const (
-	maxTextLen     = 128
-	maxNoteLen     = 500
-	maxQuantity    = 1_000_000_000
-	maxDailyWindow = 366
-)
-
-type itemKey struct {
-	sku       string
-	warehouse string
-}
+const pgUniqueViolation = "23505"
 
 type Store struct {
-	mu           sync.RWMutex
-	now          func() time.Time
-	items        map[itemKey]Item
-	movements    []Movement
-	activity     []Activity
-	nextMovement int64
-	nextActivity int64
+	db  *pgxpool.Pool
+	now func() time.Time
 }
 
-func NewStore(now func() time.Time) *Store {
+func NewStore(db *pgxpool.Pool, now func() time.Time) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{
-		now:   now,
-		items: make(map[itemKey]Item),
-	}
+	return &Store{db: db, now: now}
 }
 
-func (s *Store) ListItems(warehouse string) []Item {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	out := make([]Item, 0, len(s.items))
-	for _, it := range s.items {
-		if warehouse != "" && it.Warehouse != warehouse {
-			continue
-		}
-		out = append(out, it)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].SKU != out[j].SKU {
-			return out[i].SKU < out[j].SKU
-		}
-		return out[i].Warehouse < out[j].Warehouse
-	})
-	return out
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.Ping(ctx)
 }
 
-func (s *Store) GetItem(sku, warehouse string) (Item, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+const itemColumns = "sku, name, category, warehouse, quantity, reorder_point, unit_cost"
 
-	it, ok := s.items[itemKey{sku, warehouse}]
-	if !ok {
+func scanItem(row pgx.CollectableRow) (Item, error) {
+	var it Item
+	err := row.Scan(&it.SKU, &it.Name, &it.Category, &it.Warehouse, &it.Quantity, &it.ReorderPoint, &it.UnitCost)
+	return it, err
+}
+
+func (s *Store) ListItems(ctx context.Context, warehouse string) ([]Item, error) {
+	rows, err := s.db.Query(ctx,
+		"SELECT "+itemColumns+" FROM items WHERE $1 = '' OR warehouse = $1 ORDER BY sku, warehouse",
+		warehouse)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanItem)
+}
+
+func (s *Store) GetItem(ctx context.Context, sku, warehouse string) (Item, error) {
+	rows, err := s.db.Query(ctx,
+		"SELECT "+itemColumns+" FROM items WHERE sku = $1 AND warehouse = $2",
+		sku, warehouse)
+	if err != nil {
+		return Item{}, err
+	}
+	it, err := pgx.CollectExactlyOneRow(rows, scanItem)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return Item{}, ErrNotFound
 	}
-	return it, nil
+	return it, err
 }
 
-func (s *Store) CreateItem(in Item) (Item, error) {
-	in.SKU = strings.TrimSpace(in.SKU)
-	in.Name = strings.TrimSpace(in.Name)
-	in.Category = strings.TrimSpace(in.Category)
-	in.Warehouse = strings.TrimSpace(in.Warehouse)
-
+func (s *Store) CreateItem(ctx context.Context, in Item) (Item, error) {
+	in = normalizeItem(in)
 	if err := validateItem(in); err != nil {
 		return Item{}, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	key := itemKey{in.SKU, in.Warehouse}
-	if _, exists := s.items[key]; exists {
+	rows, err := s.db.Query(ctx,
+		`INSERT INTO items (sku, name, category, warehouse, quantity, reorder_point, unit_cost, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING `+itemColumns,
+		in.SKU, in.Name, in.Category, in.Warehouse, in.Quantity, in.ReorderPoint, in.UnitCost, s.now().UTC())
+	if err != nil {
+		return Item{}, err
+	}
+	it, err := pgx.CollectExactlyOneRow(rows, scanItem)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
 		return Item{}, ErrConflict
 	}
-	s.items[key] = in
-	return in, nil
+	return it, err
 }
 
-func (s *Store) RecordMovement(in MovementInput) (Movement, error) {
-	in.SKU = strings.TrimSpace(in.SKU)
-	in.Warehouse = strings.TrimSpace(in.Warehouse)
-	in.ToWarehouse = strings.TrimSpace(in.ToWarehouse)
-	in.Note = strings.TrimSpace(in.Note)
-
+func (s *Store) RecordMovement(ctx context.Context, in MovementInput) (Movement, error) {
+	in = normalizeMovement(in)
 	if err := validateMovement(in); err != nil {
 		return Movement{}, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	srcKey := itemKey{in.SKU, in.Warehouse}
-	src, ok := s.items[srcKey]
-	if !ok {
-		return Movement{}, ErrNotFound
-	}
-
-	switch in.Kind {
-	case Received:
-		src.Quantity += in.Quantity
-	case Shipped, Transferred:
-		if src.Quantity < in.Quantity {
-			return Movement{}, ErrInsufficientStock
+	var m Movement
+	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		if in.Kind == Transferred {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO items (sku, name, category, warehouse, quantity, reorder_point, unit_cost, created_at)
+				SELECT sku, name, category, $3, 0, reorder_point, unit_cost, $4
+				FROM items WHERE sku = $1 AND warehouse = $2
+				ON CONFLICT (sku, warehouse) DO NOTHING`,
+				in.SKU, in.Warehouse, in.ToWarehouse, s.now().UTC()); err != nil {
+				return err
+			}
 		}
-		src.Quantity -= in.Quantity
-	case Adjusted:
-		if src.Quantity+in.Quantity < 0 {
-			return Movement{}, ErrInsufficientStock
+
+		rows, err := tx.Query(ctx,
+			`SELECT warehouse, name, quantity FROM items
+			WHERE sku = $1 AND warehouse IN ($2, $3)
+			ORDER BY warehouse
+			FOR UPDATE`,
+			in.SKU, in.Warehouse, in.ToWarehouse)
+		if err != nil {
+			return err
 		}
-		src.Quantity += in.Quantity
-	}
-
-	if in.Kind == Transferred {
-		dstKey := itemKey{in.SKU, in.ToWarehouse}
-		dst, ok := s.items[dstKey]
-		if !ok {
-			dst = src
-			dst.Warehouse = in.ToWarehouse
-			dst.Quantity = 0
+		type locked struct {
+			warehouse string
+			name      string
+			quantity  int
 		}
-		dst.Quantity += in.Quantity
-		s.items[dstKey] = dst
-	}
-	s.items[srcKey] = src
+		lockedRows, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (locked, error) {
+			var l locked
+			err := r.Scan(&l.warehouse, &l.name, &l.quantity)
+			return l, err
+		})
+		if err != nil {
+			return err
+		}
 
-	now := s.now().UTC()
-	s.nextMovement++
-	m := Movement{
-		ID:          s.nextMovement,
-		Kind:        in.Kind,
-		SKU:         in.SKU,
-		Quantity:    in.Quantity,
-		Warehouse:   in.Warehouse,
-		ToWarehouse: in.ToWarehouse,
-		Note:        in.Note,
-		CreatedAt:   now,
-	}
-	s.movements = append(s.movements, m)
+		var src *locked
+		for i := range lockedRows {
+			if lockedRows[i].warehouse == in.Warehouse {
+				src = &lockedRows[i]
+			}
+		}
+		if src == nil {
+			return ErrNotFound
+		}
 
-	s.nextActivity++
-	s.activity = append(s.activity, Activity{
-		ID:         s.nextActivity,
-		Kind:       m.Kind,
-		Text:       describe(m, src.Name),
-		Time:       now,
-		MovementID: m.ID,
+		delta := in.Quantity
+		switch in.Kind {
+		case Shipped, Transferred:
+			delta = -in.Quantity
+		}
+		if src.quantity+delta < 0 {
+			return ErrInsufficientStock
+		}
+
+		if _, err := tx.Exec(ctx,
+			"UPDATE items SET quantity = quantity + $3 WHERE sku = $1 AND warehouse = $2",
+			in.SKU, in.Warehouse, delta); err != nil {
+			return err
+		}
+		if in.Kind == Transferred {
+			if _, err := tx.Exec(ctx,
+				"UPDATE items SET quantity = quantity + $3 WHERE sku = $1 AND warehouse = $2",
+				in.SKU, in.ToWarehouse, in.Quantity); err != nil {
+				return err
+			}
+		}
+
+		now := s.now().UTC()
+		var toWarehouse *string
+		if in.ToWarehouse != "" {
+			toWarehouse = &in.ToWarehouse
+		}
+		m = Movement{
+			Kind:        in.Kind,
+			SKU:         in.SKU,
+			Quantity:    in.Quantity,
+			Warehouse:   in.Warehouse,
+			ToWarehouse: in.ToWarehouse,
+			Note:        in.Note,
+		}
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO movements (kind, sku, warehouse, to_warehouse, quantity, note, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			RETURNING id, created_at`,
+			in.Kind, in.SKU, in.Warehouse, toWarehouse, in.Quantity, in.Note, now).Scan(&m.ID, &m.CreatedAt); err != nil {
+			return err
+		}
+		m.CreatedAt = m.CreatedAt.UTC()
+
+		_, err = tx.Exec(ctx,
+			"INSERT INTO activity (kind, text, movement_id, created_at) VALUES ($1, $2, $3, $4)",
+			m.Kind, describe(m, src.name), m.ID, now)
+		return err
 	})
-
+	if err != nil {
+		return Movement{}, err
+	}
 	return m, nil
 }
 
-func (s *Store) ListMovements(f MovementFilter) []Movement {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	out := make([]Movement, 0)
-	for i := len(s.movements) - 1; i >= 0; i-- {
-		m := s.movements[i]
-		if f.SKU != "" && m.SKU != f.SKU {
-			continue
-		}
-		if f.Warehouse != "" && m.Warehouse != f.Warehouse && m.ToWarehouse != f.Warehouse {
-			continue
-		}
-		out = append(out, m)
-		if f.Limit > 0 && len(out) == f.Limit {
-			break
-		}
+func (s *Store) ListMovements(ctx context.Context, f MovementFilter) ([]Movement, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = maxListLimit
 	}
-	return out
+	rows, err := s.db.Query(ctx,
+		`SELECT id, kind, sku, quantity, warehouse, COALESCE(to_warehouse, ''), note, created_at
+		FROM movements
+		WHERE ($1 = '' OR sku = $1)
+		  AND ($2 = '' OR warehouse = $2 OR to_warehouse = $2)
+		ORDER BY id DESC
+		LIMIT $3`,
+		f.SKU, f.Warehouse, limit)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Movement, error) {
+		var m Movement
+		err := r.Scan(&m.ID, &m.Kind, &m.SKU, &m.Quantity, &m.Warehouse, &m.ToWarehouse, &m.Note, &m.CreatedAt)
+		m.CreatedAt = m.CreatedAt.UTC()
+		return m, err
+	})
 }
 
-func (s *Store) DailyMovements(days int) ([]MovementDay, error) {
+func (s *Store) DailyMovements(ctx context.Context, days int) ([]MovementDay, error) {
 	if days < 1 || days > maxDailyWindow {
 		return nil, &ValidationError{"days", fmt.Sprintf("must be between 1 and %d", maxDailyWindow)}
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	today := s.now().UTC().Truncate(24 * time.Hour)
 	start := today.AddDate(0, 0, -(days - 1))
 
-	out := make([]MovementDay, days)
-	index := make(map[string]int, days)
-	for i := range out {
-		d := start.AddDate(0, 0, i).Format(time.DateOnly)
-		out[i].Date = d
-		index[d] = i
+	rows, err := s.db.Query(ctx,
+		`SELECT to_char(g.day, 'YYYY-MM-DD'),
+			COALESCE(SUM(CASE
+				WHEN m.kind = 'received' THEN m.quantity
+				WHEN m.kind = 'adjusted' AND m.quantity > 0 THEN m.quantity
+			END), 0)::bigint,
+			COALESCE(SUM(CASE
+				WHEN m.kind = 'shipped' THEN m.quantity
+				WHEN m.kind = 'adjusted' AND m.quantity < 0 THEN -m.quantity
+			END), 0)::bigint
+		FROM generate_series($1::timestamp, $2::timestamp, interval '1 day') AS g(day)
+		LEFT JOIN movements m
+			ON m.created_at >= (g.day AT TIME ZONE 'UTC')
+			AND m.created_at < ((g.day + interval '1 day') AT TIME ZONE 'UTC')
+		GROUP BY g.day
+		ORDER BY g.day`,
+		start.Format(time.DateOnly), today.Format(time.DateOnly))
+	if err != nil {
+		return nil, err
 	}
-
-	for _, m := range s.movements {
-		if m.CreatedAt.Before(start) {
-			continue
-		}
-		i, ok := index[m.CreatedAt.Format(time.DateOnly)]
-		if !ok {
-			continue
-		}
-		switch {
-		case m.Kind == Received, m.Kind == Adjusted && m.Quantity > 0:
-			out[i].Inbound += m.Quantity
-		case m.Kind == Shipped:
-			out[i].Outbound += m.Quantity
-		case m.Kind == Adjusted && m.Quantity < 0:
-			out[i].Outbound -= m.Quantity
-		}
-	}
-	return out, nil
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (MovementDay, error) {
+		var d MovementDay
+		err := r.Scan(&d.Date, &d.Inbound, &d.Outbound)
+		return d, err
+	})
 }
 
-func (s *Store) ListActivity(limit int) []Activity {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	n := len(s.activity)
-	if limit > 0 && limit < n {
-		n = limit
+func (s *Store) ListActivity(ctx context.Context, limit int) ([]Activity, error) {
+	if limit <= 0 {
+		limit = maxListLimit
 	}
-	out := make([]Activity, 0, n)
-	for i := len(s.activity) - 1; i >= 0 && len(out) < n; i-- {
-		out = append(out, s.activity[i])
+	rows, err := s.db.Query(ctx,
+		"SELECT id, kind, text, created_at, movement_id FROM activity ORDER BY id DESC LIMIT $1",
+		limit)
+	if err != nil {
+		return nil, err
 	}
-	return out
-}
-
-func validateItem(it Item) error {
-	if err := requireText("sku", it.SKU); err != nil {
-		return err
-	}
-	if err := requireText("name", it.Name); err != nil {
-		return err
-	}
-	if err := requireText("warehouse", it.Warehouse); err != nil {
-		return err
-	}
-	if len(it.Category) > maxTextLen {
-		return &ValidationError{"category", fmt.Sprintf("must be at most %d characters", maxTextLen)}
-	}
-	if it.Quantity < 0 || it.Quantity > maxQuantity {
-		return &ValidationError{"quantity", fmt.Sprintf("must be between 0 and %d", maxQuantity)}
-	}
-	if it.ReorderPoint < 0 || it.ReorderPoint > maxQuantity {
-		return &ValidationError{"reorderPoint", fmt.Sprintf("must be between 0 and %d", maxQuantity)}
-	}
-	if it.UnitCost < 0 || math.IsNaN(it.UnitCost) || math.IsInf(it.UnitCost, 0) {
-		return &ValidationError{"unitCost", "must be a non-negative number"}
-	}
-	return nil
-}
-
-func validateMovement(in MovementInput) error {
-	if !in.Kind.Valid() {
-		return &ValidationError{"kind", "must be one of received, shipped, adjusted, transferred"}
-	}
-	if err := requireText("sku", in.SKU); err != nil {
-		return err
-	}
-	if err := requireText("warehouse", in.Warehouse); err != nil {
-		return err
-	}
-	if len(in.Note) > maxNoteLen {
-		return &ValidationError{"note", fmt.Sprintf("must be at most %d characters", maxNoteLen)}
-	}
-
-	if in.Kind == Adjusted {
-		if in.Quantity == 0 || in.Quantity < -maxQuantity || in.Quantity > maxQuantity {
-			return &ValidationError{"quantity", fmt.Sprintf("must be non-zero and between -%d and %d", maxQuantity, maxQuantity)}
-		}
-	} else if in.Quantity <= 0 || in.Quantity > maxQuantity {
-		return &ValidationError{"quantity", fmt.Sprintf("must be between 1 and %d", maxQuantity)}
-	}
-
-	if in.Kind == Transferred {
-		if err := requireText("toWarehouse", in.ToWarehouse); err != nil {
-			return err
-		}
-		if in.ToWarehouse == in.Warehouse {
-			return &ValidationError{"toWarehouse", "must differ from warehouse"}
-		}
-	} else if in.ToWarehouse != "" {
-		return &ValidationError{"toWarehouse", "only allowed for transferred movements"}
-	}
-	return nil
-}
-
-func requireText(field, v string) error {
-	if v == "" {
-		return &ValidationError{field, "is required"}
-	}
-	if len(v) > maxTextLen {
-		return &ValidationError{field, fmt.Sprintf("must be at most %d characters", maxTextLen)}
-	}
-	return nil
-}
-
-func describe(m Movement, name string) string {
-	label := m.SKU
-	if name != "" {
-		label = fmt.Sprintf("%s (%s)", m.SKU, name)
-	}
-	switch m.Kind {
-	case Received:
-		return fmt.Sprintf("Received %d × %s at %s", m.Quantity, label, m.Warehouse)
-	case Shipped:
-		return fmt.Sprintf("Shipped %d × %s from %s", m.Quantity, label, m.Warehouse)
-	case Adjusted:
-		return fmt.Sprintf("Adjusted %s at %s by %+d", label, m.Warehouse, m.Quantity)
-	case Transferred:
-		return fmt.Sprintf("Transferred %d × %s from %s to %s", m.Quantity, label, m.Warehouse, m.ToWarehouse)
-	}
-	return label
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Activity, error) {
+		var a Activity
+		err := r.Scan(&a.ID, &a.Kind, &a.Text, &a.Time, &a.MovementID)
+		a.Time = a.Time.UTC()
+		return a, err
+	})
 }

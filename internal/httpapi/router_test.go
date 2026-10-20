@@ -10,12 +10,13 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/RyeT7/Minotaur-BE/internal/inventory"
+	"github.com/RyeT7/Minotaur-BE/internal/testdb"
 )
 
-func newTestRouter(t *testing.T) http.Handler {
+func newTestRouter(t *testing.T, store *inventory.Store) http.Handler {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	r, err := NewRouter(inventory.NewStore(nil), Options{AllowedOrigins: []string{"http://localhost:5173"}})
+	r, err := NewRouter(store, Options{AllowedOrigins: []string{"http://localhost:5173"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +35,11 @@ func do(t *testing.T, h http.Handler, method, path, body string) *httptest.Respo
 }
 
 func TestMovementFlow(t *testing.T) {
-	h := newTestRouter(t)
+	h := newTestRouter(t, inventory.NewStore(testdb.New(t), nil))
+
+	if rec := do(t, h, http.MethodGet, "/readyz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("readyz: %d %s", rec.Code, rec.Body)
+	}
 
 	if rec := do(t, h, http.MethodPost, "/api/v1/items", `{"sku":"WID-1","name":"Widget","warehouse":"WH-A","quantity":5}`); rec.Code != http.StatusCreated {
 		t.Fatalf("create item: %d %s", rec.Code, rec.Body)
@@ -60,7 +65,7 @@ func TestMovementFlow(t *testing.T) {
 }
 
 func TestRejectsBadInput(t *testing.T) {
-	h := newTestRouter(t)
+	h := newTestRouter(t, inventory.NewStore(nil, nil))
 
 	cases := []struct {
 		name, method, path, body string
@@ -82,7 +87,7 @@ func TestRejectsBadInput(t *testing.T) {
 }
 
 func TestCORS(t *testing.T) {
-	h := newTestRouter(t)
+	h := newTestRouter(t, inventory.NewStore(nil, nil))
 
 	for origin, want := range map[string]string{
 		"http://localhost:5173": "http://localhost:5173",

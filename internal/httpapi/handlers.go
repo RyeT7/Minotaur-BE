@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -25,12 +27,28 @@ type errorBody struct {
 	Field string `json:"field,omitempty"`
 }
 
+func (h *handlers) ready(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if err := h.store.Ping(ctx); err != nil {
+		_ = c.Error(err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "database unavailable"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
 func (h *handlers) listItems(c *gin.Context) {
-	c.JSON(http.StatusOK, h.store.ListItems(c.Query("warehouse")))
+	items, err := h.store.ListItems(c.Request.Context(), c.Query("warehouse"))
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, items)
 }
 
 func (h *handlers) getItem(c *gin.Context) {
-	it, err := h.store.GetItem(c.Param("sku"), c.Param("warehouse"))
+	it, err := h.store.GetItem(c.Request.Context(), c.Param("sku"), c.Param("warehouse"))
 	if err != nil {
 		writeError(c, err)
 		return
@@ -44,7 +62,7 @@ func (h *handlers) createItem(c *gin.Context) {
 		writeBindError(c, err)
 		return
 	}
-	it, err := h.store.CreateItem(in)
+	it, err := h.store.CreateItem(c.Request.Context(), in)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -57,11 +75,16 @@ func (h *handlers) listMovements(c *gin.Context) {
 	if !ok {
 		return
 	}
-	c.JSON(http.StatusOK, h.store.ListMovements(inventory.MovementFilter{
+	movements, err := h.store.ListMovements(c.Request.Context(), inventory.MovementFilter{
 		SKU:       c.Query("sku"),
 		Warehouse: c.Query("warehouse"),
 		Limit:     limit,
-	}))
+	})
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, movements)
 }
 
 func (h *handlers) recordMovement(c *gin.Context) {
@@ -70,7 +93,7 @@ func (h *handlers) recordMovement(c *gin.Context) {
 		writeBindError(c, err)
 		return
 	}
-	m, err := h.store.RecordMovement(in)
+	m, err := h.store.RecordMovement(c.Request.Context(), in)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -83,7 +106,7 @@ func (h *handlers) dailyMovements(c *gin.Context) {
 	if !ok {
 		return
 	}
-	out, err := h.store.DailyMovements(days)
+	out, err := h.store.DailyMovements(c.Request.Context(), days)
 	if err != nil {
 		writeError(c, err)
 		return
@@ -96,7 +119,12 @@ func (h *handlers) listActivity(c *gin.Context) {
 	if !ok {
 		return
 	}
-	c.JSON(http.StatusOK, h.store.ListActivity(limit))
+	activity, err := h.store.ListActivity(c.Request.Context(), limit)
+	if err != nil {
+		writeError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, activity)
 }
 
 func queryInt(c *gin.Context, name string, def, lo, hi int) (int, bool) {
